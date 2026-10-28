@@ -1,0 +1,32 @@
+
+<div class="challenges-container">
+    <div class="campaign-header">
+        <h1>SQLXpert Campaign Arena</h1>
+        <p>Unlock chapters from basic queries to enterprise PL/SQL architecture.</p>
+        <div class="player-stats-bar">
+            <span>🪙 SQL-Coins: <strong id="user-coins">250</strong></span>
+            <span>⭐ Total XP: <strong id="user-xp">1240</strong></span>
+            <span>🏆 Rank: <strong id="user-rank">Query Optimizer</strong></span>
+            <a href="/challenges/store" class="btn-store">🛍️ Reward Store</a>
+        </div>
+    </div>
+
+    <div class="skill-tree">
+        {% for chapter in chapters %}
+        <div class="chapter-card {% if chapter.id == 1 %}unlocked{% else %}locked{% endif %}" data-chapter="{{ chapter.id }}">
+            <div class="chapter-badge">Chapter {{ chapter.id }}</div>
+            <h2>{{ chapter.title }}</h2>
+            <p>{{ chapter.description }}</p>
+            <div class="chapter-challenges">
+                {% for chal in chapter.challenges %}
+                <a href="/challenges/arena?qid={{ chal.id }}" class="challenge-node">
+                    <span>{{ chal.title }}</span>
+                    <small>{{ chal.difficulty }} | ⏱️ {{ chal.time_limit // 60 }}m</small>
+                </a>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+<link rel="stylesheet" href="{{ url_for('static', filename='challenges.css') }}">

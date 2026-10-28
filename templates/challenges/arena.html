@@ -1,0 +1,67 @@
+
+{% extends "base.html" %}
+
+{% block title %}Challenge Arena | SQLXpert{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='challenges.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="arena-layout">
+    <div class="arena-sidebar">
+        <div class="timer-box">
+            <span>Time Remaining</span>
+            <h2 id="countdown-timer">05:00</h2>
+        </div>
+
+        <div class="problem-meta">
+            <h3 id="chal-title">Loading Challenge...</h3>
+            <p id="chal-prompt">Please select a challenge from the campaign map.</p>
+
+            <div class="hint-box">
+                <h4>Schema Hint:</h4>
+                <p id="chal-hint">Select a node to view table definitions.</p>
+            </div>
+        </div>
+
+        <div class="powerup-inventory">
+            <h4>Power-Ups</h4>
+            <button onclick="usePowerUp('time_ext_3')">
+                +3 Mins (Cost: 50 🪙)
+            </button>
+            <button onclick="usePowerUp('schema_hint')">
+                Reveal Hint (Cost: 30 🪙)
+            </button>
+        </div>
+    </div>
+
+    <div class="arena-main">
+        <div class="editor-toolbar">
+            <span>Dialect: PostgreSQL / PL-SQL Simulator</span>
+            <button class="btn-run" onclick="runTests()">▶ Run Tests</button>
+            <button class="btn-submit" onclick="submitSolution()">✔ Submit Solution</button>
+        </div>
+
+        <div id="monaco-editor-container"
+             style="height: 450px; border: 1px solid #333;">
+        </div>
+
+        <div class="console-output">
+            <h4>Execution Console / Test Results</h4>
+            <pre id="console-output-log">Ready for execution...</pre>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.39.0/min/vs/loader.min.js"></script>
+
+<script>
+    window.currentChallengeId = {{ challenge.id | tojson }};
+    window.isPlSqlChallenge = {{ challenge.is_plsql | default(false) | tojson }};
+</script>
+
+<script src="{{ url_for('static', filename='challenges.js') }}"></script>
+{% endblock %}

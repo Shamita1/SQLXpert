@@ -1,0 +1,288 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SQLXpert - My Tables</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1000px;
+            margin: 30px auto;
+            padding: 0 16px;
+            background: #f5f7fb;
+            color: #202938;
+        }
+        section {
+            background: white;
+            padding: 20px;
+            margin: 18px 0;
+            border-radius: 10px;
+        }
+        input, select, textarea, button {
+            padding: 10px;
+            margin: 5px 0;
+            box-sizing: border-box;
+        }
+        input, select, textarea { max-width: 100%; }
+        textarea { width: 100%; min-height: 110px; }
+        button { cursor: pointer; }
+        .column-row { display: flex; gap: 8px; flex-wrap: wrap; }
+        pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        #result { overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>SQLXpert: My Tables</h1>
+    <p>Create your own tables, insert records, and practise SQL queries.</p>
+
+    <section>
+        <h2>Create a table</h2>
+        <label>Table name</label><br>
+        <input id="tableName" placeholder="students">
+        <div id="columnRows">
+            <div class="column-row">
+                <input placeholder="Column name" class="col-name">
+                <select class="col-type">
+                    <option>TEXT</option>
+                    <option>INTEGER</option>
+                    <option>REAL</option>
+                    <option>NUMERIC</option>
+                </select>
+            </div>
+        </div>
+        <button onclick="addColumn()">Add column</button>
+        <button onclick="createTable()">Create table</button>
+    </section>
+
+    <section>
+        <h2>My tables</h2>
+        <button onclick="loadTables()">Refresh tables</button>
+        <select id="tableSelect" onchange="loadRecords()">
+            <option value="">Choose a table</option>
+        </select>
+        <div id="records"></div>
+    </section>
+
+    <section>
+        <h2>Insert a record</h2>
+        <div id="recordForm">Choose a table first.</div>
+        <button onclick="insertRecord()">Insert record</button>
+    </section>
+
+    <section>
+        <h2>SQL query editor</h2>
+        <textarea id="sqlInput"
+            placeholder="SELECT * FROM students;"></textarea>
+        <br>
+        <button onclick="runQuery()">Run query</button>
+        <div id="result"></div>
+    </section>
+
+    <script>
+        let currentColumns = [];
+
+        async function api(url, options = {}) {
+            const response = await fetch(url, {
+                ...options,
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(options.headers || {})
+                }
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || "Request failed");
+            return data;
+        }
+
+        function showMessage(message) {
+            document.getElementById("result").textContent = message;
+        }
+
+        function addColumn() {
+            const row = document.createElement("div");
+            row.className = "column-row";
+
+            const name = document.createElement("input");
+            name.placeholder = "Column name";
+            name.className = "col-name";
+
+            const type = document.createElement("select");
+            type.className = "col-type";
+
+            ["TEXT", "INTEGER", "REAL", "NUMERIC"].forEach(value => {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = value;
+                type.appendChild(option);
+            });
+
+            row.append(name, type);
+            document.getElementById("columnRows").appendChild(row);
+        }
+
+        async function createTable() {
+            try {
+                const columns = [...document.querySelectorAll(".column-row")]
+                    .map(row => ({
+                        name: row.querySelector(".col-name").value.trim(),
+                        type: row.querySelector(".col-type").value
+                    }))
+                    .filter(column => column.name);
+
+                const data = await api("/api/user-tables", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        table_name: document.getElementById("tableName").value.trim(),
+                        columns
+                    })
+                });
+
+                showMessage(data.message);
+                await loadTables();
+            } catch (error) {
+                showMessage(error.message);
+            }
+        }
+
+        async function loadTables() {
+            try {
+                const data = await api("/api/user-tables");
+                const select = document.getElementById("tableSelect");
+                const previous = select.value;
+
+                select.replaceChildren(new Option("Choose a table", ""));
+                data.tables.forEach(name => select.add(new Option(name, name)));
+
+                if (data.tables.includes(previous)) select.value = previous;
+                await loadRecords();
+            } catch (error) {
+                showMessage(error.message);
+            }
+        }
+
+        async function loadRecords() {
+            const table = document.getElementById("tableSelect").value;
+            const recordsDiv = document.getElementById("records");
+            const form = document.getElementById("recordForm");
+
+            recordsDiv.replaceChildren();
+            form.replaceChildren();
+            currentColumns = [];
+
+            if (!table) {
+                form.textContent = "Choose a table first.";
+                return;
+            }
+
+            try {
+                const data = await api(
+                    "/api/user-tables/" + encodeURIComponent(table) + "/records"
+                );
+                currentColumns = data.columns;
+
+                const formFields = document.createDocumentFragment();
+                currentColumns.forEach(column => {
+                    const label = document.createElement("label");
+                    label.textContent = column;
+                    const input = document.createElement("input");
+                    input.dataset.column = column;
+                    input.className = "record-value";
+                    input.placeholder = column;
+                    input.style.display = "block";
+                    formFields.append(label, input);
+                });
+                form.appendChild(formFields);
+
+                const tableElement = document.createElement("table");
+                const head = tableElement.createTHead().insertRow();
+                data.columns.forEach(column => {
+                    const th = document.createElement("th");
+                    th.textContent = column;
+                    head.appendChild(th);
+                });
+
+                const body = tableElement.createTBody();
+                data.records.forEach(record => {
+                    const row = body.insertRow();
+                    data.columns.forEach(column => {
+                        row.insertCell().textContent = record[column] ?? "";
+                    });
+                });
+
+                recordsDiv.appendChild(tableElement);
+            } catch (error) {
+                showMessage(error.message);
+            }
+        }
+
+        async function insertRecord() {
+            const table = document.getElementById("tableSelect").value;
+            if (!table) return showMessage("Choose a table first.");
+
+            const values = {};
+            document.querySelectorAll(".record-value").forEach(input => {
+                if (input.value !== "") values[input.dataset.column] = input.value;
+            });
+
+            try {
+                const data = await api(
+                    "/api/user-tables/" + encodeURIComponent(table) + "/records",
+                    { method: "POST", body: JSON.stringify({ values }) }
+                );
+                showMessage(data.message);
+                await loadRecords();
+            } catch (error) {
+                showMessage(error.message);
+            }
+        }
+
+        async function runQuery() {
+            try {
+                const data = await api("/api/user-query", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        sql: document.getElementById("sqlInput").value
+                    })
+                });
+
+                const output = document.getElementById("result");
+                output.replaceChildren();
+
+                if (data.rows) {
+                    const table = document.createElement("table");
+                    const head = table.createTHead().insertRow();
+                    data.columns.forEach(column => {
+                        const th = document.createElement("th");
+                        th.textContent = column;
+                        head.appendChild(th);
+                    });
+
+                    const body = table.createTBody();
+                    data.rows.forEach(record => {
+                        const row = body.insertRow();
+                        data.columns.forEach(column => {
+                            row.insertCell().textContent = record[column] ?? "";
+                        });
+                    });
+
+                    output.appendChild(table);
+                    if (data.limited) {
+                        output.append("Showing the first 500 rows.");
+                    }
+                } else {
+                    output.textContent =
+                        data.message + " Rows affected: " + data.affected_rows;
+                }
+            } catch (error) {
+                showMessage(error.message);
+            }
+        }
+
+        loadTables();
+    </script>
+</body>
+</html>

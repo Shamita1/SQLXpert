@@ -1,0 +1,435 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SQLXpert — SQL Learning Studio</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+<div class="app-shell">
+
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-mark">SX</div>
+            <div>
+                <strong>SQLXpert</strong>
+                <small>SQL Learning Studio</small>
+            </div>
+        </div>
+
+        <div class="side-label">WORKSPACE</div>
+
+        <button class="nav active" data-tab="workspace">⌘ <span>SQL Workspace</span></button>
+        <button class="nav" data-tab="compiler">◇ <span>Compiler Trace</span></button>
+        <button class="nav" data-tab="challenges">◎ <span>SQL Challenges</span></button>
+        <button class="nav" data-tab="history">◷ <span>Query History</span></button>
+
+        <div class="sidebar-bottom">
+            <div class="status-dot"></div>
+            <span>Local demo database</span>
+            <small>SQLite</small>
+        </div>
+    </aside>
+
+    <main class="main">
+
+        <header class="topbar">
+            <div>
+                <div class="eyebrow">LEARN · DEBUG · VISUALIZE</div>
+                <h1 id="page-title">SQL Workspace</h1>
+            </div>
+
+            <div class="top-actions">
+                <span class="pill"><i></i> Demo database connected</span>
+
+                <!-- Optional account links -->
+                {% if session.get('user_id') %}
+                    <span class="pill">
+                        Welcome, {{ session.get('username', 'User') }}
+                    </span>
+
+                    <form action="{{ url_for('auth.logout') }}"
+                          method="post"
+                          style="display:inline;">
+                        <button class="btn btn-ghost" type="submit">
+                            Logout
+                        </button>
+                    </form>
+                {% else %}
+                    <a class="btn btn-ghost"
+                       href="{{ url_for('auth.login') }}">Login</a>
+
+                    <a class="btn btn-secondary"
+                       href="{{ url_for('auth.register') }}">Register</a>
+                {% endif %}
+
+                <button class="btn btn-ghost" id="refresh-btn">↻ Refresh</button>
+            </div>
+        </header>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <span>Queries executed</span>
+                <strong id="stat-queries">0</strong>
+                <small>Across this session and saved history</small>
+            </div>
+
+            <div class="stat-card">
+                <span>Successful queries</span>
+                <strong id="stat-success">0</strong>
+                <small>Queries that returned results</small>
+            </div>
+
+            <div class="stat-card">
+                <span>Challenges solved</span>
+                <strong id="stat-solved">0</strong>
+                <small id="stat-attempts">0 attempts</small>
+            </div>
+
+            <div class="stat-card">
+                <span>Query success rate</span>
+                <strong id="stat-rate">0%</strong>
+                <small>Based on recorded executions</small>
+            </div>
+        </section>
+
+        <!-- SQL WORKSPACE -->
+        <section id="tab-workspace" class="tab-panel">
+
+            <!-- Custom data management -->
+            <div class="panel custom-data-panel">
+                <div class="panel-head">
+                    <div>
+                        <span class="step-chip green">NEW</span>
+                        <strong>Manage your own data</strong>
+                        <small>Create tables and insert rows without leaving SQLXpert</small>
+                    </div>
+                    <span class="tiny-badge">Custom tables</span>
+                </div>
+
+                
+                <div class="custom-data-grid">
+
+                    <form id="create-table-form" class="data-form">
+                        <h3>Create a table</h3>
+
+                        <label for="new-table-name">Table name</label>
+                        <input
+                            id="new-table-name"
+                            required
+                            pattern="[A-Za-z_][A-Za-z0-9_]*"
+                            placeholder="employees">
+
+                        <label for="new-table-columns">Columns (comma-separated)</label>
+                        <input
+                            id="new-table-columns"
+                            required
+                            placeholder="id INTEGER, name TEXT, salary REAL">
+
+                        <small>Types allowed: INTEGER, REAL, TEXT, BLOB, NUMERIC</small>
+
+                        <button class="btn btn-primary" type="submit">
+                            ＋ Create table
+                        </button>
+                    </form>
+
+                    
+                    <form id="insert-row-form" class="data-form">
+                        <h3>Add a row using a form</h3>
+
+                        <label for="insert-table-name">Table</label>
+                        <select id="insert-table-name" required>
+                            <option value="">Choose a table…</option>
+                        </select>
+
+                        <label for="insert-row-values">Column values (SQL format)</label>
+                        <textarea
+                            id="insert-row-values"
+                            required
+                            rows="3"
+                            placeholder="1, 'Priya', 'CSE'"></textarea>
+
+                        <small>Enter values in table-column order. Use single quotes for text and commas between values.</small>
+
+                        <button class="btn btn-primary" type="submit">
+                            ＋ Insert row
+                        </button>
+                    </form>
+
+
+                </div>
+
+
+                <div class="custom-data-note">
+                    You can also use <code>CREATE TABLE</code> and
+                    <code>INSERT INTO ... VALUES</code> directly in the SQL editor below.
+                    SQLXpert blocks UPDATE, DELETE, DROP, and other commands that are
+                    not enabled in this learning demo.
+                </div>
+
+                <div id="custom-data-feedback"
+                     class="custom-data-feedback"
+                     aria-live="polite"></div>
+            </div>
+
+            <!-- Query editor and schema -->
+            <div class="workspace-grid">
+
+                <div class="panel editor-panel">
+                    <div class="panel-head">
+                        <div>
+                            <span class="step-chip">01</span>
+                            <strong>Query editor</strong>
+                            <small>Run SELECT, CREATE TABLE, or INSERT INTO</small>
+                        </div>
+                        <button class="text-btn" id="reset-btn">Reset</button>
+                    </div>
+
+                    <div class="editor-toolbar">
+                        <span class="language-tag">SQL</span>
+                        <span>Compiler-aware workspace</span>
+                        <div class="toolbar-spacer"></div>
+                        <button class="icon-btn" id="format-btn" title="Format query">
+                            ↵ Format
+                        </button>
+                    </div>
+
+                    <textarea id="sql-editor" spellcheck="false" aria-label="SQL query editor">SELECT name, department, marks
+FROM students
+WHERE marks >= 85
+ORDER BY marks DESC;</textarea>
+
+                    <div class="editor-footer">
+                        <span id="editor-count">4 lines</span>
+                        <span>SELECT · CREATE TABLE · INSERT INTO</span>
+                    </div>
+
+                    <div class="button-row">
+                        <button class="btn btn-primary" id="run-btn">▶ Run query</button>
+                        <button class="btn btn-secondary" id="analyze-btn">◇ Analyze</button>
+                        <button class="btn btn-secondary" id="explain-btn">⌁ Explain plan</button>
+                    </div>
+
+                    <div class="quick-examples">
+                        <span>Try:</span>
+                        <button data-query="SELECT * FROM students;">All students</button>
+                        <button data-query="SELECT department, AVG(marks) AS avg_marks FROM students GROUP BY department ORDER BY avg_marks DESC;">Average marks</button>
+                        <button data-query="SELECT s.name, c.course_name FROM students s JOIN enrollments e ON s.student_id = e.student_id JOIN courses c ON e.course_id = c.course_id ORDER BY s.name;">Join tables</button>
+                    </div>
+                </div>
+
+                <div class="panel schema-panel">
+                    <div class="panel-head">
+                        <div>
+                            <span class="step-chip purple">02</span>
+                            <strong>Database schema</strong>
+                            <small>Sample learning dataset</small>
+                        </div>
+                        <span class="tiny-badge" id="schema-count">Loading tables…</span>
+                    </div>
+
+                    <div id="schema-list" class="schema-list">
+                        <div class="loading">Loading schema…</div>
+                    </div>
+
+                    <div class="schema-note">
+                        <span>ⓘ</span>
+                        <div>
+                            <strong>Explore the schema</strong>
+                            <p>Use table and column names exactly as shown. Try a misspelled column to see semantic debugging.</p>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Query output -->
+            <div class="panel results-panel">
+                <div class="panel-head result-heading">
+                    <div>
+                        <span class="step-chip green">03</span>
+                        <strong>Query output</strong>
+                        <small id="result-subtitle">Run a query to see rows and diagnostics</small>
+                    </div>
+                    <div class="result-meta" id="result-meta"></div>
+                </div>
+
+                <div id="results-area" class="results-area empty-state">
+                    <div class="empty-icon">▤</div>
+                    <strong>Your results will appear here</strong>
+                    <p>Run a SELECT query to view rows, or run CREATE TABLE / INSERT INTO to change your custom data.</p>
+                </div>
+            </div>
+
+            <!-- TraceLearn -->
+            <div class="panel trace-panel">
+                <div class="panel-head">
+                    <div>
+                        <span class="step-chip orange">04</span>
+                        <strong>TraceLearn · Query understanding</strong>
+                        <small>Connect compiler evidence to actionable feedback</small>
+                    </div>
+                    <span class="novelty-tag">PROJECT ENHANCEMENT</span>
+                </div>
+
+                <div class="trace-actions">
+                    <button class="btn btn-secondary" id="debug-btn">✧ Diagnose query</button>
+                    <button class="btn btn-secondary" id="explain-query-btn">Explain SQL</button>
+                    <button class="btn btn-secondary" id="generate-btn">✧ Generate from English</button>
+                </div>
+
+                <div id="trace-area" class="trace-grid">
+                    <div class="trace-placeholder">
+                        Analyze or run a query to see its compiler trace, error evidence and suggested next step.
+                    </div>
+                </div>
+            </div>
+
+        </section>
+
+        <!-- COMPILER TRACE -->
+        <section id="tab-compiler" class="tab-panel hidden">
+            <div class="panel">
+                <div class="panel-head">
+                    <div>
+                        <span class="step-chip">01</span>
+                        <strong>Compiler trace</strong>
+                        <small>SQL source → tokens → AST → diagnostics</small>
+                    </div>
+                    <button class="btn btn-primary" id="compiler-analyze-btn">
+                        Analyze current query
+                    </button>
+                </div>
+
+                <div class="compiler-stages">
+                    <div class="stage">
+                        <span>1</span>
+                        <strong>Source SQL</strong>
+                        <small>Input text</small>
+                    </div>
+                    <b>→</b>
+                    <div class="stage">
+                        <span>2</span>
+                        <strong>Lexer</strong>
+                        <small>Token stream</small>
+                    </div>
+                    <b>→</b>
+                    <div class="stage">
+                        <span>3</span>
+                        <strong>Parser</strong>
+                        <small>Structure checks</small>
+                    </div>
+                    <b>→</b>
+                    <div class="stage">
+                        <span>4</span>
+                        <strong>AST</strong>
+                        <small>Query representation</small>
+                    </div>
+                </div>
+
+                <div class="two-col">
+                    <div>
+                        <h3>Lexical tokens</h3>
+                        <div id="tokens-area" class="code-output">Click Analyze to generate tokens.</div>
+                    </div>
+                    <div>
+                        <h3>Abstract syntax tree (AST)</h3>
+                        <div id="ast-area" class="ast-tree">
+                          Analyze a SQL query to build its AST tree.
+                        </div>
+                    </div>
+                </div>
+
+                <h3>Compiler diagnostics</h3>
+                <div id="diagnostics-area" class="diagnostics empty-state">
+                    No analysis has been run.
+                </div>
+
+                <p class="disclaimer">
+                    Educational parser note: this prototype implements transparent checks
+                    for a useful SELECT subset. It is not a complete SQL grammar or a
+                    replacement for the database parser.
+                </p>
+            </div>
+        </section>
+
+        <!-- SQL CHALLENGES -->
+        <section id="tab-challenges" class="tab-panel hidden">
+            <div class="panel">
+                <div class="panel-head">
+                    <div>
+                        <span class="step-chip purple">LAB</span>
+                        <strong>SQL challenges</strong>
+                        <small>Practice queries against the sample schema</small>
+                    </div>
+                </div>
+
+                <div id="challenge-list" class="challenge-list">
+                    Loading challenges…
+                </div>
+
+                <div class="challenge-work">
+                    <h3 id="challenge-title">Choose a challenge</h3>
+                    <p id="challenge-description">Pick a problem above to start solving it.</p>
+
+                    <textarea id="challenge-editor"
+                    spellcheck="false"
+                    placeholder="Write your SQL query here..."
+                    aria-label="Challenge SQL editor"></textarea>
+                    
+                    <div class="button-row">
+                        <button class="btn btn-primary" id="submit-challenge-btn" type="button">
+                            Check Answer
+                        </button>
+
+                        <button class="btn btn-secondary" id="hint-btn" type="button">
+                            Hint
+                        </button>
+
+                        <button class="btn btn-secondary" id="next-challenge-btn" type="button">
+                            Next →
+                        </button>
+                    </div>
+
+
+                    <div id="challenge-feedback"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- QUERY HISTORY -->
+        <section id="tab-history" class="tab-panel hidden">
+            <div class="panel">
+                <div class="panel-head">
+                    <div>
+                        <span class="step-chip green">LOG</span>
+                        <strong>Query history</strong>
+                        <small>Recent query attempts saved in the local database</small>
+                    </div>
+                    <button class="btn btn-secondary" id="history-refresh-btn">
+                        Refresh history
+                    </button>
+                </div>
+
+                <div id="history-list" class="history-list">
+                    Loading history…
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            SQLXpert · Compiler Design Lab prototype
+            <span>TraceLearn · Evidence-backed SQL learning</span>
+        </footer>
+
+    </main>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="{{ url_for('static', filename='app.js', v=2) }}"></script>
+</body>
+</html>

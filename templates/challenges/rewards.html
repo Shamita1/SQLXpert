@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="store-container">
+    <h1>SQL-Coin Reward Store</h1>
+    <p>Spend your hard-earned coins on power-ups, themes, and badges.</p>
+    <div class="balance-banner">
+        <span>Your Balance: <strong id="store-coins">250</strong> 🪙-Coins</span>
+    </div>
+
+    <div class="store-grid">
+        {% for item in items %}
+        <div class="store-item-card">
+            <h3>{{ item.name }}</h3>
+            <p>{{ item.description }}</p>
+            <div class="item-footer">
+                <span class="cost">{{ item.cost }} 🪙</span>
+                <button onclick="buyItem('{{ item.item_id }}')" class="btn-buy">Purchase</button>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+<link rel="stylesheet" href="{{ url_for('static', filename='challenges.css') }}">
+{% endblock %}

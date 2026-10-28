@@ -1,0 +1,63 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login | SQLXpert</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #101827;
+            color: #f8fafc;
+            display: grid;
+            place-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .card {
+            width: min(380px, 88%);
+            background: #1e293b;
+            padding: 28px;
+            border-radius: 14px;
+        }
+        input, button {
+            box-sizing: border-box;
+            width: 100%;
+            padding: 12px;
+            margin-top: 12px;
+            border-radius: 7px;
+            border: 1px solid #475569;
+        }
+        input { background: #0f172a; color: white; }
+        button {
+            background: #38bdf8;
+            color: #082f49;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        a { color: #7dd3fc; }
+        .message { margin: 10px 0; color: #fda4af; }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <h1>Welcome to SQLXpert</h1>
+        <p>Log in to continue learning SQL.</p>
+
+        {% for category, message in get_flashed_messages(with_categories=true) %}
+            <p class="message">{{ message }}</p>
+        {% endfor %}
+
+        <form method="post">
+            <input name="identity" placeholder="Username or email"
+                   required autocomplete="username">
+            <input name="password" type="password" placeholder="Password"
+                   required autocomplete="current-password">
+            <button type="submit">Log In</button>
+        </form>
+
+        <p>New to SQLXpert? <a href="{{ url_for('auth.register') }}">Create an account</a></p>
+        <p><a href="{{ url_for('home') }}">Back to SQLXpert</a></p>
+    </main>
+</body>
+</html>

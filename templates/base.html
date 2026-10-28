@@ -1,0 +1,28 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}SQLXpert Challenges{% endblock %}</title>
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='challenges.css') }}">
+
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <header style="padding: 16px 24px;">
+        <a href="/" style="text-decoration: none;">← Back to SQLXpert</a>
+        <span style="margin-left: 20px;">SQLXpert Campaign</span>
+    </header>
+
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

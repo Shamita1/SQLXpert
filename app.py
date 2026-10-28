@@ -1,0 +1,1119 @@
+from flask import Flask, render_template, request, jsonify
+import sqlite3, re, os, time, json
+from datetime import datetime
+from modules.module1 import module1_bp
+from modules.compiler import analyze_sql
+from modules.query_engine.user_tables import user_tables_bp
+from difflib import get_close_matches
+from modules.challenges.challenge_engine import CHAPTERS
+from modules.challenges.rewards import SHOP_ITEMS
+from modules.challenges.plsql_simulator import execute_plsql_simulation
+from modules.challenges.scoring import calculate_reward
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(APP_DIR, "sqlxpert.db")
+app = Flask(__name__)
+
+# Temporary CSV/JSON/Excel import workspaces (read-only SQL).
+from modules.import_workspace import register_import_workspace
+register_import_workspace(app)
+app.register_blueprint(module1_bp, url_prefix="/api/module1")
+app.register_blueprint(user_tables_bp)
+app.config["SECRET_KEY"] = "replace-with-a-long-random-secret"
+from modules.auth import auth_bp
+from modules.auth.routes import init_auth_db
+from modules.challenges import get_challenges, submit_challenge
+app.register_blueprint(auth_bp)
+init_auth_db()
+# ---------------- Demo database and persistence ----------------
+def connect_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def initialize_db():
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS students (
+        student_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        age INTEGER,
+        department TEXT,
+        marks REAL
+    );
+    CREATE TABLE IF NOT EXISTS courses (
+        course_id INTEGER PRIMARY KEY,
+        course_name TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS enrollments (
+        student_id INTEGER,
+        course_id INTEGER,
+        PRIMARY KEY (student_id, course_id),
+        FOREIGN KEY (student_id) REFERENCES students(student_id),
+        FOREIGN KEY (course_id) REFERENCES courses(course_id)
+    );
+    CREATE TABLE IF NOT EXISTS query_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query_text TEXT NOT NULL,
+        status TEXT NOT NULL,
+        duration_ms REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        error_text TEXT
+    );
+    CREATE TABLE IF NOT EXISTS challenge_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        challenge_id INTEGER NOT NULL,
+        correct INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS player_profile (
+        user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        coins INTEGER DEFAULT 100,
+        xp INTEGER DEFAULT 0,
+        rank_title TEXT DEFAULT 'Junior DBA'
+    );
+    CREATE TABLE IF NOT EXISTS player_inventory (
+        item_id TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS unlocked_chapters (
+        chapter_id INTEGER PRIMARY KEY
+    );
+    """)
+    count = cur.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+    if count == 0:
+        cur.executemany("INSERT INTO students VALUES (?, ?, ?, ?, ?)", [
+            (1, "Asha", 20, "CSE", 92.0),
+            (2, "Rahul", 19, "ECE", 78.0),
+            (3, "Meera", 21, "CSE", 88.0),
+            (4, "Arjun", 18, "IT", 81.0),
+            (5, "Nila", 22, "CSE", 95.0),
+        ])
+        cur.executemany("INSERT INTO courses VALUES (?, ?)", [
+            (101, "Compiler Design"), (102, "Database Systems"), (103, "Operating Systems")
+        ])
+        cur.executemany("INSERT INTO enrollments VALUES (?, ?)", [
+            (1, 101), (1, 102), (2, 102), (3, 101), (4, 103), (5, 101), (5, 102)
+        ])
+                # Ensure the campaign player profile exists
+    cur.execute("""
+            INSERT OR IGNORE INTO player_profile
+            (user_id, coins, xp, rank_title)
+            VALUES (1, 100, 0, 'Junior DBA')
+    """)
+
+        # Ensure Chapter 1 is unlocked
+    cur.execute("""
+            INSERT OR IGNORE INTO unlocked_chapters (chapter_id)
+            VALUES (1)
+    """)
+    conn.commit()
+    conn.close()
+
+initialize_db()
+
+
+
+# ---------------- Compiler-inspired SQL processing ----------------
+KEYWORDS = set("""
+SELECT FROM WHERE AND OR NOT NULL IS IN LIKE BETWEEN AS DISTINCT
+ORDER BY ASC DESC LIMIT OFFSET JOIN INNER LEFT RIGHT OUTER ON
+GROUP BY HAVING COUNT SUM AVG MIN MAX INSERT UPDATE DELETE CREATE DROP
+TABLE INTO VALUES SET UNION ALL CASE WHEN THEN ELSE END EXISTS
+""".split())
+
+TOKEN_RE = re.compile(
+    r"(?P<SPACE>\s+)|(?P<COMMENT>--[^\n]*|/\*[\s\S]*?\*/)|"
+    r"(?P<STRING>'(?:''|[^'])*')|(?P<QUOTED>\"(?:\"\"|[^\"])*\"|`[^`]*`|\[[^\]]*\])|"
+    r"(?P<NUMBER>\d+(?:\.\d+)?)|(?P<OP><=|>=|<>|!=|==|[=<>+\-*/%])|"
+    r"(?P<PUNCT>[(),.;])|(?P<IDENT>[A-Za-z_][A-Za-z0-9_$]*)|(?P<OTHER>.)"
+)
+
+def tokenize(sql):
+    tokens = []
+    for match in TOKEN_RE.finditer(sql):
+        kind, value = match.lastgroup, match.group()
+        if kind in ("SPACE", "COMMENT"):
+            continue
+        pos = match.start()
+        line = sql.count("\n", 0, pos) + 1
+        last_nl = sql.rfind("\n", 0, pos)
+        column = pos - last_nl
+        if kind == "IDENT" and value.upper() in KEYWORDS:
+            kind = "KEYWORD"
+        elif kind == "QUOTED":
+            kind = "QUOTED_IDENTIFIER"
+        elif kind == "OTHER":
+            kind = "UNKNOWN"
+        tokens.append({"type": kind, "value": value, "line": line, "column": column})
+    return tokens
+
+
+
+def safe_select_guard(sql):
+    # Defense-in-depth: only one SELECT statement is accepted by this demo.
+    cleaned = re.sub(r"--[^\n]*|/\*[\s\S]*?\*/", "", sql).strip()
+    if not re.match(r"(?is)^SELECT\b", cleaned):
+        return False, "Only SELECT queries are allowed in this demo."
+    # Allow one trailing semicolon, but reject any other statement separator.
+    without_trailing = cleaned[:-1] if cleaned.endswith(";") else cleaned
+    if ";" in without_trailing:
+        return False, "Multiple SQL statements are not allowed."
+    forbidden = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|PRAGMA|REPLACE|VACUUM)\b", re.I)
+    if forbidden.search(without_trailing):
+        return False, "A non-read-only SQL operation was detected."
+    return True, ""
+
+def schema_info():
+    conn = connect_db()
+    tables = {}
+    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+        name = row["name"]
+        if name in ("query_history", "challenge_attempts"):
+            continue
+        tables[name] = [dict(r) for r in conn.execute(f"PRAGMA table_info('{name}')")]
+    conn.close()
+    return tables
+
+def suggest_schema_correction(error_message):
+    """Suggest a likely table or column name from the current schema."""
+    message = error_message.lower()
+    schema = schema_info()
+
+    # Handle a missing table.
+    match = re.search(r"no such table:\s*[\"'`]?([a-zA-Z_]\w*)", message)
+    if match:
+        missing = match.group(1)
+        candidates = list(schema.keys())
+        close = get_close_matches(missing, candidates, n=1, cutoff=0.55)
+
+        if close:
+            return (
+                f"Table '{missing}' was not found. "
+                f"Did you mean '{close[0]}'?"
+            )
+
+        return (
+            f"Table '{missing}' was not found. "
+            "Check the schema panel or create the table first."
+        )
+
+    # Handle a missing column.
+    match = re.search(r"no such column:\s*[\"'`]?([a-zA-Z_]\w*)", message)
+    if match:
+        missing = match.group(1)
+        candidates = []
+
+        for table, columns in schema.items():
+            for column in columns:
+                candidates.append(column["name"])
+
+        close = get_close_matches(
+            missing, list(set(candidates)), n=3, cutoff=0.55
+        )
+
+        if close:
+            return (
+                f"Column '{missing}' was not found. "
+                f"Similar column name(s): {', '.join(close)}. "
+                "Check the table name and any table aliases."
+            )
+
+        return (
+            f"Column '{missing}' was not found. "
+            "Check the column names in the schema panel."
+        )
+
+    if "syntax error" in message:
+        return (
+            "There may be a missing keyword, comma, parenthesis, "
+            "or an incorrectly ordered SQL clause. "
+            "Check the query structure."
+        )
+
+    if "ambiguous column name" in message:
+        return (
+            "More than one table contains this column name. "
+            "Use a table name or alias, such as s.student_id."
+        )
+
+    if "no such function" in message:
+        return (
+            "SQLite does not recognize this function. "
+            "Check its spelling and whether SQLite supports it."
+        )
+
+    return (
+        "Review the database error and verify the SQL syntax, "
+        "table names, column names, and data types."
+    )
+
+def record_history(query, status, duration, error=""):
+    conn = connect_db()
+    conn.execute(
+        "INSERT INTO query_history(query_text,status,duration_ms,created_at,error_text) VALUES(?,?,?,?,?)",
+        (query, status, round(duration, 3), datetime.now().isoformat(timespec="seconds"), error[:500])
+    )
+    conn.commit()
+    conn.close()
+
+def execute_select(sql):
+    allowed, reason = safe_select_guard(sql)
+    if not allowed:
+        raise ValueError(reason)
+    conn = connect_db()
+    try:
+        # SQLite progress handler interrupts long-running queries after ~1.5 seconds.
+        started = time.perf_counter()
+        conn.set_progress_handler(lambda: 1 if time.perf_counter() - started > 1.5 else 0, 10000)
+        cursor = conn.execute(sql)
+        rows = cursor.fetchmany(201)
+        if len(rows) > 200:
+            rows = rows[:200]
+        columns = [d[0] for d in (cursor.description or [])]
+        return columns, [dict(r) for r in rows], (time.perf_counter() - started) * 1000
+    finally:
+        conn.close()
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.get("/api/schema")
+def api_schema():
+    return jsonify({"schema": schema_info()})
+
+@app.get("/my-tables")
+def my_tables_page():
+    return render_template("user_tables.html")
+
+@app.post("/api/create-table")
+def api_create_table():
+    data = request.get_json(force=True)
+    table = str(data.get("table_name", "")).strip()
+    raw_columns = str(data.get("columns", "")).strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        return jsonify({"error": "Table name must start with a letter/underscore and contain only letters, numbers, and underscores."}), 400
+    if table.lower() in {"query_history", "challenge_attempts", "sqlite_sequence"} or table.lower().startswith("sqlite_"):
+        return jsonify({"error": "That table name is reserved."}), 400
+    # Form syntax: column_name TYPE, column_name TYPE. Limit types to common SQLite types.
+    allowed_types = {"INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"}
+    columns = []
+    for item in raw_columns.split(","):
+        bits = item.strip().split()
+        if len(bits) != 2 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", bits[0]) or bits[1].upper() not in allowed_types:
+            return jsonify({"error": "Define columns like: id INTEGER, name TEXT, salary REAL. Allowed types: INTEGER, REAL, TEXT, BLOB, NUMERIC."}), 400
+        columns.append((bits[0], bits[1].upper()))
+    if not columns:
+        return jsonify({"error": "Enter at least one column."}), 400
+    if len({c[0].lower() for c in columns}) != len(columns):
+        return jsonify({"error": "Column names must be unique."}), 400
+    definitions = ", ".join('"' + name + '" ' + kind for name, kind in columns)
+    conn = connect_db()
+    try:
+        conn.execute('CREATE TABLE "' + table + '" (' + definitions + ')')
+        conn.commit()
+    except sqlite3.Error as exc:
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+    return jsonify({"success": True, "message": f"Table '{table}' created.", "schema": schema_info()})
+
+@app.post("/api/insert-row")
+def api_insert_row():
+    data = request.get_json(force=True)
+    table = str(data.get("table_name", "")).strip()
+    values = data.get("values", {})
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+        return jsonify({"error": "Choose a valid table."}), 400
+    if table.lower() in {"query_history", "challenge_attempts"} or table.lower().startswith("sqlite_"):
+        return jsonify({"error": "That table cannot be edited here."}), 400
+    if not isinstance(values, dict) or not values:
+        return jsonify({"error": "Enter at least one column value."}), 400
+    conn = connect_db()
+    try:
+        actual = {row["name"] for row in conn.execute('PRAGMA table_info("' + table + '")')}
+        if not actual:
+            return jsonify({"error": f"Table '{table}' does not exist."}), 404
+        if any(key not in actual for key in values):
+            return jsonify({"error": "One or more column names do not exist in this table."}), 400
+        names = list(values.keys())
+        placeholders = ",".join("?" for _ in names)
+        quoted = ",".join('"' + name.replace('"', '""') + '"' for name in names)
+        conn.execute('INSERT INTO "' + table + '" (' + quoted + ') VALUES (' + placeholders + ')', [values[name] for name in names])
+        conn.commit()
+    except sqlite3.Error as exc:
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+    return jsonify({"success": True, "message": f"Row added to '{table}'.", "schema": schema_info()})
+
+@app.post("/api/analyze")
+def api_analyze():
+    data = request.get_json(force=True)
+    sql = data.get("sql", "")
+
+    tokens, ast, errors = analyze_sql(sql, schema_info())
+
+    return jsonify({
+        "tokens": tokens,
+        "ast": ast,
+        "diagnostics": errors,
+        "schema": schema_info(),
+        "success": len(errors) == 0
+    })
+
+@app.post("/api/execute")
+def api_execute():
+    data = request.get_json(force=True)
+    sql = data.get("sql", "").strip()
+    start = time.perf_counter()
+    try:
+        if not sql:
+            raise ValueError("Enter a SQL command first.")
+        tokens, ast, diagnostics = analyze_sql(sql)
+        if diagnostics:
+            raise ValueError(diagnostics[0]["message"])
+        command = re.sub(r"^\s*(?:--[^\n]*\n|/\*[\s\S]*?\*/\s*)*", "", sql).strip().rstrip(";").strip()
+        # SQLite's execute() accepts only one statement; additionally reject protected/internal objects.
+        first = command.split(None, 1)[0].upper()
+        if first == "SELECT":
+            columns, rows, duration = execute_select(sql)
+            record_history(sql, "success", duration)
+            return jsonify({"success": True, "command": "SELECT", "columns": columns, "rows": rows, "row_count": len(rows), "duration_ms": round(duration, 3), "message": "Query executed successfully."})
+        if first == "CREATE":
+            match = re.match(r"(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)", command)
+            if not match:
+                raise ValueError("Only CREATE TABLE with a simple table name is supported.")
+            table_name = match.group(1)
+            if table_name.lower() in {"query_history", "challenge_attempts", "sqlite_sequence"} or table_name.lower().startswith("sqlite_"):
+                raise ValueError("That table name is reserved by SQLXpert/SQLite.")
+            conn = connect_db()
+            try:
+                conn.execute(command)
+                conn.commit()
+            finally:
+                conn.close()
+            duration = (time.perf_counter() - start) * 1000
+            record_history(sql, "success", duration)
+            return jsonify({"success": True, "command": "CREATE", "columns": [], "rows": [], "row_count": 0, "duration_ms": round(duration, 3), "message": f"Table '{table_name}' created successfully. Refresh the schema panel."})
+        if first == "INSERT":
+            match = re.match(r"(?is)^INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", command)
+            if not match:
+                raise ValueError("Only INSERT INTO table_name ... VALUES (...) is supported.")
+            table_name = match.group(1)
+            if table_name.lower() in {"query_history", "challenge_attempts"} or table_name.lower().startswith("sqlite_"):
+                raise ValueError("Inserting into SQLXpert's internal tables is not allowed.")
+            if not re.match(r"(?is)^INSERT\s+INTO\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^;]*?\)\s*)?VALUES\s*\(", command):
+                raise ValueError("Use INSERT INTO table_name (columns) VALUES (values). INSERT ... SELECT is not enabled.")
+            conn = connect_db()
+            try:
+                conn.execute(command)
+                conn.commit()
+            finally:
+                conn.close()
+            duration = (time.perf_counter() - start) * 1000
+            record_history(sql, "success", duration)
+            return jsonify({"success": True, "command": "INSERT", "columns": [], "rows": [], "row_count": 0, "duration_ms": round(duration, 3), "message": "Row inserted successfully."})
+        raise ValueError("Supported commands are SELECT, CREATE TABLE, and INSERT INTO.")
+    except Exception as exc:
+        duration = (time.perf_counter() - start) * 1000
+        try:
+            record_history(sql, "error", duration, str(exc))
+        except Exception:
+            pass
+        return jsonify({"success": False, "error": str(exc), "duration_ms": round(duration, 3)}), 400
+
+
+@app.post("/api/explain")
+def api_explain():
+    data = request.get_json(silent=True) or {}
+    sql = str(data.get("sql", "")).strip()
+
+    if not sql:
+        return jsonify({"error": "Enter a SELECT query first."}), 400
+
+    try:
+        tokens, ast, diagnostics = analyze_sql(sql, schema_info())
+
+        if diagnostics:
+            return jsonify({
+                "error": diagnostics[0].get(
+                    "message", "The query did not pass validation."
+                )
+            }), 400
+
+        allowed, reason = safe_select_guard(sql)
+        if not allowed:
+            return jsonify({"error": reason}), 400
+
+        # Obtain SQLite's execution plan.
+        conn = connect_db()
+        try:
+            plan_rows = conn.execute(
+                "EXPLAIN QUERY PLAN " + sql
+            ).fetchall()
+            raw_plan = [dict(row) for row in plan_rows]
+        finally:
+            conn.close()
+
+        readable = []
+        recommendations = []
+
+        for item in raw_plan:
+            detail = item.get("detail", "")
+            upper_detail = detail.upper()
+
+            if "SCAN " in upper_detail:
+                explanation = (
+                    "SQLite scans rows from a table or subquery. "
+                    "This may be appropriate for small tables."
+                )
+
+                if "USING INDEX" not in upper_detail:
+                    recommendations.append(
+                        "Review whether a suitable index on the "
+                        "query's filtering or joining columns could help."
+                    )
+
+            elif "SEARCH " in upper_detail:
+                explanation = (
+                    "SQLite uses a search access path. "
+                    "Check the plan details to see whether an index is used."
+                )
+
+            else:
+                explanation = (
+                    "This is a SQLite query-plan operation. "
+                    "Review the detail to understand its role."
+                )
+
+            readable.append({
+                "detail": detail,
+                "explanation": explanation
+            })
+
+        upper_sql = sql.upper()
+
+        if "SELECT *" in upper_sql:
+            recommendations.append(
+                "Consider selecting only the columns you need, "
+                "especially when working with wide tables."
+            )
+
+        if "ORDER BY" in upper_sql:
+            recommendations.append(
+                "If sorting is expensive, check whether an appropriate "
+                "index can support the ORDER BY columns."
+            )
+
+        if "JOIN" in upper_sql:
+            recommendations.append(
+                "Check that join conditions use the intended keys "
+                "and that frequently joined columns have suitable indexes."
+            )
+
+        if not recommendations:
+            recommendations.append(
+                "No obvious optimization suggestion was identified "
+                "by these basic checks. Review the plan and measured time."
+            )
+
+        # Measure execution separately from plan generation.
+        _, rows, duration = execute_select(sql)
+
+        return jsonify({
+            "plan": readable,
+            "ast": ast,
+            "duration_ms": round(duration, 3),
+            "returned_rows": len(rows),
+            "recommendations": list(dict.fromkeys(recommendations)),
+            "note": (
+                "The plan comes from SQLite EXPLAIN QUERY PLAN. "
+                "Execution time is a measurement from this run; "
+                "recommendations are heuristic, not guaranteed speedups."
+            )
+        })
+
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+
+@app.post("/api/debug")
+def api_debug():
+    data = request.get_json(silent=True) or {}
+    sql = str(data.get("sql", "")).strip()
+
+    if not sql:
+        return jsonify({
+            "source": "Input validation",
+            "message": "No SQL query was provided.",
+            "suggestion": "Enter a SQL query and try again.",
+            "confidence": "High"
+        }), 400
+
+    try:
+        # Validate against the existing compiler.
+        tokens, ast, diagnostics = analyze_sql(sql, schema_info())
+
+        if diagnostics:
+            diagnostic = diagnostics[0]
+            message = diagnostic.get(
+                "message", "The SQL query did not pass validation."
+            )
+
+            return jsonify({
+                "source": diagnostic.get("stage", "SQL validation"),
+                "message": message,
+                "suggestion": suggest_schema_correction(message),
+                "confidence": "Based on compiler diagnostics",
+                "success": False
+            })
+
+        # Execute only through the existing read-only SELECT engine.
+        columns, rows, duration = execute_select(sql)
+
+        return jsonify({
+            "source": "SQLite database and schema validation",
+            "message": (
+                f"The query executed successfully and returned "
+                f"{len(rows)} row(s) in the displayed result."
+            ),
+            "suggestion": (
+                "Review the result for correctness. "
+                "Use Performance Analysis to inspect the query plan."
+            ),
+            "confidence": "Execution verified",
+            "success": True,
+            "columns": columns,
+            "row_count": len(rows),
+            "duration_ms": round(duration, 3)
+        })
+
+    except Exception as exc:
+        message = str(exc)
+
+        return jsonify({
+            "source": "SQLite database",
+            "message": message,
+            "suggestion": suggest_schema_correction(message),
+            "confidence": "Based on the observed error",
+            "success": False
+        })
+
+
+@app.post("/api/generate")
+def api_generate():
+    import re
+
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt", "").strip()
+    p = prompt.lower()
+
+    if not p:
+        return jsonify({
+            "error": "Please enter an English sentence."
+        }), 400
+
+    # Find the table mentioned in the request.
+    table_map = {
+        "students": "students",
+        "student": "students",
+        "courses": "courses",
+        "course": "courses",
+        "enrollments": "enrollments",
+        "enrollment": "enrollments",
+        "employees": "employees",
+        "employee": "employees",
+    }
+
+    table = None
+    for word, table_name in table_map.items():
+        if re.search(r"\b" + word + r"\b", p):
+            table = table_name
+            break
+
+    # Recognize requests involving multiple related tables.
+    if "course" in p and "student" in p:
+        sql = (
+            "SELECT s.name, c.course_name "
+            "FROM students s "
+            "JOIN enrollments e ON s.student_id = e.student_id "
+            "JOIN courses c ON e.course_id = c.course_id "
+            "ORDER BY s.name;"
+        )
+        return jsonify({"sql": sql, "mode": "Rule-based generator"})
+
+    if table is None:
+        return jsonify({
+            "error": (
+                "I couldn't identify the table. "
+                "Mention students, courses, enrollments, or employees."
+            )
+        }), 400
+
+    # Common English expressions for choosing columns.
+    if any(x in p for x in [
+        "count", "how many", "total number"
+    ]):
+        sql = f"SELECT COUNT(*) AS total FROM {table};"
+
+    elif "average" in p or "avg" in p:
+        column = "marks" if table == "students" else "salary"
+        if table not in ("students", "employees"):
+            return jsonify({
+                "error": "Please specify a supported numeric column."
+            }), 400
+        sql = f"SELECT AVG({column}) AS average_value FROM {table};"
+
+    elif any(x in p for x in [
+        "highest", "maximum", "max", "top salary", "most"
+    ]):
+        column = "marks" if table == "students" else "salary"
+        if table not in ("students", "employees"):
+            return jsonify({
+                "error": "Please specify which numeric value to rank."
+            }), 400
+        sql = (
+            f"SELECT * FROM {table} "
+            f"ORDER BY {column} DESC LIMIT 1;"
+        )
+
+    elif any(x in p for x in [
+        "lowest", "minimum", "min", "least"
+    ]):
+        column = "marks" if table == "students" else "salary"
+        if table not in ("students", "employees"):
+            return jsonify({
+                "error": "Please specify which numeric value to rank."
+            }), 400
+        sql = (
+            f"SELECT * FROM {table} "
+            f"ORDER BY {column} ASC LIMIT 1;"
+        )
+
+    elif "sort" in p or "order by" in p:
+        direction = "DESC" if any(
+            x in p for x in ["descending", "highest first", "decreasing"]
+        ) else "ASC"
+
+        column = (
+            "marks" if "mark" in p or "score" in p
+            else "salary" if "salary" in p
+            else "name"
+        )
+        sql = f"SELECT * FROM {table} ORDER BY {column} {direction};"
+
+    elif any(x in p for x in [
+        "above", "greater than", "more than", "older than"
+    ]):
+        match = re.search(
+            r"(?:above|greater than|more than|older than)\s+(\d+(?:\.\d+)?)",
+            p
+        )
+        if not match:
+            return jsonify({
+                "error": "Please include a number, such as 'above 80'."
+            }), 400
+
+        number = match.group(1)
+        column = (
+            "age" if "age" in p or "older" in p
+            else "salary" if "salary" in p
+            else "marks" if "mark" in p or "score" in p
+            else None
+        )
+
+        if not column:
+            return jsonify({
+                "error": "Specify which value to compare, such as age or marks."
+            }), 400
+
+        sql = f"SELECT * FROM {table} WHERE {column} > {number};"
+
+    elif any(x in p for x in [
+        "below", "less than", "under", "younger than"
+    ]):
+        match = re.search(
+            r"(?:below|less than|under|younger than)\s+(\d+(?:\.\d+)?)",
+            p
+        )
+        if not match:
+            return jsonify({
+                "error": "Please include a number, such as 'below 80'."
+            }), 400
+
+        number = match.group(1)
+        column = (
+            "age" if "age" in p or "younger" in p
+            else "salary" if "salary" in p
+            else "marks" if "mark" in p or "score" in p
+            else None
+        )
+
+        if not column:
+            return jsonify({
+                "error": "Specify which value to compare, such as age or marks."
+            }), 400
+
+        sql = f"SELECT * FROM {table} WHERE {column} < {number};"
+
+    elif "name" in p and any(
+        x in p for x in ["only", "just", "display", "show", "list"]
+    ):
+        sql = f"SELECT name FROM {table};"
+
+    elif any(x in p for x in [
+        "all", "everything", "show", "display", "list", "get", "fetch"
+    ]):
+        sql = f"SELECT * FROM {table};"
+
+    else:
+        return jsonify({
+            "error": (
+                "I couldn't understand that request yet. "
+                "Try asking to show all rows, count rows, sort by a column, "
+                "or filter a numeric column."
+            )
+        }), 400
+
+    return jsonify({
+        "sql": sql,
+        "mode": "Rule-based generator",
+        "notice": "Review the SQL and table/column names before running it."
+    })
+
+
+@app.post("/api/explain-query")
+def api_explain_query():
+    sql = request.get_json(force=True).get("sql", "")
+    tokens, ast, diagnostics = analyze_sql(sql)
+    if diagnostics:
+        return jsonify({"explanation": "The query could not be fully explained because the implemented parser found a structural issue.", "diagnostics": diagnostics})
+    parts = []
+    upper = sql.upper()
+    parts.append("SELECT chooses which columns or expressions appear in the output.")
+    if "FROM" in upper: parts.append("FROM identifies the source table or tables.")
+    if "JOIN" in upper: parts.append("JOIN combines rows from related tables using a join condition.")
+    if "WHERE" in upper: parts.append("WHERE filters rows before grouping.")
+    if "GROUP BY" in upper: parts.append("GROUP BY groups rows so aggregate functions can calculate summaries.")
+    if "HAVING" in upper: parts.append("HAVING filters groups after aggregation.")
+    if "ORDER BY" in upper: parts.append("ORDER BY sorts the final rows.")
+    if "LIMIT" in upper: parts.append("LIMIT caps the number of rows returned.")
+    return jsonify({"explanation": " ".join(parts), "ast": ast, "note": "Rule-based explanation of supported clauses."})
+
+
+
+@app.get("/api/challenges")
+def api_challenges():
+    return jsonify({"challenges": get_challenges()})
+
+
+@app.post("/api/challenges/submit")
+def api_challenge_submit():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        challenge_id = int(data.get("challenge_id", 0))
+    except (TypeError, ValueError):
+        return jsonify({
+            "success": False,
+            "error": "Invalid challenge ID."
+        }), 400
+
+    result = submit_challenge(
+        challenge_id,
+        data.get("sql", "")
+    )
+
+    if not result["success"]:
+        status = 404 if result["feedback"] == "Challenge not found." else 400
+        return jsonify({
+            "success": False,
+            "error": result["feedback"],
+            "hint": result["hint"]
+        }), status
+
+    conn = connect_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO challenge_attempts
+                (challenge_id, correct, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                challenge_id,
+                int(result["correct"]),
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True,
+        "correct": result["correct"],
+        "message": result["feedback"],
+        "hint": result["hint"],
+        "points_earned": result["score"],
+        "max_score": result["max_score"],
+        "columns": result["columns"],
+        "rows": result["rows"]
+    })
+
+@app.get("/api/history")
+def api_history():
+    conn = connect_db()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM query_history ORDER BY id DESC LIMIT 30")]
+    conn.close()
+    return jsonify({"history": rows})
+
+@app.get("/api/stats")
+def api_stats():
+    conn = connect_db()
+    total = conn.execute("SELECT COUNT(*) FROM query_history").fetchone()[0]
+    successful = conn.execute("SELECT COUNT(*) FROM query_history WHERE status='success'").fetchone()[0]
+    attempts = conn.execute("SELECT COUNT(*) FROM challenge_attempts").fetchone()[0]
+    solved = conn.execute("SELECT COUNT(*) FROM challenge_attempts WHERE correct=1").fetchone()[0]
+    conn.close()
+    return jsonify({"queries_run": total, "successful_queries": successful, "challenges_attempted": attempts, "challenges_solved": solved, "query_success_rate": round(successful / total * 100, 1) if total else 0, "challenge_accuracy": round(solved / attempts * 100, 1) if attempts else 0})
+
+
+
+
+
+@app.route("/challenges")
+def challenges_campaign():
+    conn = connect_db()
+    profile = conn.execute("SELECT * FROM player_profile WHERE user_id = 1").fetchone()
+    unlocked = {row["chapter_id"] for row in conn.execute("SELECT chapter_id FROM unlocked_chapters").fetchall()}
+    conn.close()
+    return render_template("challenges/campaign.html", chapters=CHAPTERS, profile=profile, unlocked_chapters=unlocked)
+
+@app.route("/challenges/arena")
+def challenges_arena():
+    qid = request.args.get("qid", "ch1_q1")
+    # Find the challenge object across chapters
+    target_challenge = None
+    for chap in CHAPTERS:
+        for chal in chap["challenges"]:
+            if chal["id"] == qid:
+                target_challenge = chal
+                break
+    return render_template("challenges/arena.html", challenge=target_challenge or CHAPTERS[0]["challenges"][0])
+
+@app.route("/challenges/store")
+def challenges_store():
+    conn = connect_db()
+    profile = conn.execute("SELECT * FROM player_profile WHERE user_id = 1").fetchone()
+    inventory = {row["item_id"] for row in conn.execute("SELECT item_id FROM player_inventory").fetchall()}
+    conn.close()
+    return render_template("challenges/rewards.html", items=SHOP_ITEMS, profile=profile, inventory=inventory)
+
+@app.post("/api/challenges/run")
+def api_challenges_run():
+    data = request.get_json(silent=True) or {}
+    code = data.get("code", "")
+    is_plsql = data.get("is_plsql", False)
+
+    if is_plsql:
+        sim_result = execute_plsql_simulation(code)
+        return jsonify(sim_result)
+    else:
+        # Standard SQL execution safety check using your existing engine
+        try:
+            columns, rows, duration = execute_select(code)
+            return jsonify({
+                "success": True,
+                "output": [f"Query executed successfully in {round(duration, 2)}ms."],
+                "columns": columns,
+                "rows": rows
+            })
+        except Exception as exc:
+            return jsonify({
+                "success": False,
+                "output": [str(exc)],
+                "columns": [],
+                "rows": []
+            }), 400
+
+@app.post("/api/challenges/complete")
+def api_challenges_complete():
+    data = request.get_json(silent=True) or {}
+    challenge_id = data.get("challenge_id")
+    time_remaining = int(data.get("time_remaining", 0))
+    total_time = int(data.get("total_time", 300))
+    base_xp = int(data.get("base_xp", 100))
+    base_coins = int(data.get("base_coins", 20))
+
+    earned_xp, earned_coins = calculate_reward(base_xp, base_coins, time_remaining, total_time)
+
+    conn = connect_db()
+    try:
+        conn.execute("""
+            UPDATE player_profile 
+            SET coins = coins + ?, xp = xp + ? 
+            WHERE user_id = 1
+        """, (earned_coins, earned_xp))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True,
+        "earned_xp": earned_xp,
+        "earned_coins": earned_coins,
+        "message": f"Challenge completed! Awarded {earned_coins} SQL-Coins and {earned_xp} XP."
+    })
+
+
+@app.post("/api/shop/buy")
+def api_shop_buy():
+    data = request.get_json(silent=True) or {}
+    item_id = data.get("item_id")
+
+    # Find the requested shop item
+    item_meta = next(
+        (item for item in SHOP_ITEMS if item["item_id"] == item_id),
+        None
+    )
+
+    if not item_meta:
+        return jsonify({
+            "success": False,
+            "error": "Item not found."
+        }), 404
+
+    cost = item_meta["cost"]
+    conn = connect_db()
+
+    try:
+        # Get the player's profile
+        profile = conn.execute(
+            "SELECT coins FROM player_profile WHERE user_id = 1"
+        ).fetchone()
+
+        # Create a profile if it does not exist
+        if profile is None:
+            conn.execute("""
+                INSERT OR IGNORE INTO player_profile
+                (user_id, coins, xp, rank_title)
+                VALUES (1, 100, 0, 'Junior DBA')
+            """)
+
+            profile = conn.execute(
+                "SELECT coins FROM player_profile WHERE user_id = 1"
+            ).fetchone()
+
+        if profile is None:
+            return jsonify({
+                "success": False,
+                "error": "Could not initialize player profile."
+            }), 500
+
+        # Check whether the player can afford the item
+        if profile["coins"] < cost:
+            return jsonify({
+                "success": False,
+                "error": "Insufficient SQL-Coins."
+            }), 400
+
+        # Deduct coins and add the purchased item
+        conn.execute(
+            "UPDATE player_profile SET coins = coins - ? WHERE user_id = 1",
+            (cost,)
+        )
+
+        conn.execute(
+            "INSERT OR IGNORE INTO player_inventory (item_id) VALUES (?)",
+            (item_id,)
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True,
+        "message": f"Successfully purchased {item_meta['name']}!"
+    })
+
+
+@app.get("/api/campaign/data")
+def api_campaign_data():
+    conn = connect_db()
+    profile = conn.execute("SELECT * FROM player_profile WHERE user_id = 1").fetchone()
+    unlocked = [row["chapter_id"] for row in conn.execute("SELECT chapter_id FROM unlocked_chapters").fetchall()]
+    inventory = [row["item_id"] for row in conn.execute("SELECT item_id FROM player_inventory").fetchall()]
+    conn.close()
+    
+    return jsonify({
+        "chapters": CHAPTERS,
+        "shop_items": SHOP_ITEMS,
+        "profile": dict(profile) if profile else {"coins": 100, "xp": 0, "rank_title": "Junior DBA"},
+        "unlocked_chapters": unlocked,
+        "inventory": inventory
+    })
+
+@app.post("/api/campaign/run")
+def api_campaign_run():
+    data = request.get_json(silent=True) or {}
+    code = data.get("code", "")
+    is_plsql = data.get("is_plsql", False)
+
+    if is_plsql:
+        sim_result = execute_plsql_simulation(code)
+        return jsonify(sim_result)
+    else:
+        try:
+            columns, rows, duration = execute_select(code)
+            return jsonify({
+                "success": True,
+                "output": [f"Query executed successfully in {round(duration, 2)}ms."],
+                "columns": columns,
+                "rows": rows
+            })
+        except Exception as exc:
+            return jsonify({
+                "success": False,
+                "output": [str(exc)],
+                "columns": [],
+                "rows": []
+            }), 400
+
+@app.post("/api/campaign/complete")
+def api_campaign_complete():
+    data = request.get_json(silent=True) or {}
+    time_remaining = int(data.get("time_remaining", 0))
+    total_time = int(data.get("total_time", 300))
+    base_xp = int(data.get("base_xp", 100))
+    base_coins = int(data.get("base_coins", 20))
+
+    earned_xp, earned_coins = calculate_reward(base_xp, base_coins, time_remaining, total_time)
+
+    conn = connect_db()
+    try:
+        conn.execute("UPDATE player_profile SET coins = coins + ?, xp = xp + ? WHERE user_id = 1", (earned_coins, earned_xp))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True,
+        "earned_xp": earned_xp,
+        "earned_coins": earned_coins,
+        "message": f"Challenge completed! +{earned_coins} Coins, +{earned_xp} XP"
+    })
+
+
+
+if __name__ == "__main__":
+    print("SQLXpert is starting. Open http://127.0.0.1:5000 in your browser.")
+    app.run(debug=True, port=5000)
